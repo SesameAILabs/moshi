@@ -77,6 +77,7 @@ pub struct State {
     // For repetition penalty, we provide the context len (in text tokens) and the penalty.
     repetition_penalty: Option<(usize, f32)>,
     forced_audio_tokens: crate::lm::ForcedAudioTokens,
+    user_rating: u32,
     cfg_alpha: Option<f64>,
     config: Config,
 }
@@ -113,6 +114,7 @@ impl State {
             pad_mult,
             repetition_penalty,
             forced_audio_tokens,
+            user_rating: 0, // 0 indicates no ratings have been submitted from the front
             cfg_alpha,
             config,
         }
@@ -130,10 +132,17 @@ impl State {
         &self.config
     }
 
+    pub fn user_rating(&self) -> u32 {
+        self.user_rating
+    }
+    pub fn set_user_rating(&mut self, grade: u32) {
+        self.user_rating = grade
+    }
+
     fn apply_repetition_penalty(&self, logits: Tensor) -> candle::Result<Tensor> {
         let logits = match self.repetition_penalty {
             None => logits,
-            Some((_, penalty)) if penalty == 1. => logits,
+            Some((_, 1.)) => logits,
             Some((context_size, penalty)) => {
                 let device = logits.device();
                 let mut logits = logits.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?;
@@ -215,7 +224,8 @@ impl State {
         };
         let (text_logits, ys) = match ca_src.as_ref() {
             None => {
-                let (logits, ys) = self.model.forward_cond(text_token, codes, conditions)?;
+                let (logits, ys) =
+                    self.model.forward_cond(text_token, codes, conditions, &().into())?;
                 let logits = match self.cfg_alpha {
                     None => logits.i((0, 0))?,
                     Some(a) => match logits.dim(0)? {
@@ -229,7 +239,8 @@ impl State {
                 if self.cfg_alpha.is_some() {
                     candle::bail!("cfg is not supported with cross attention")
                 }
-                let (logits, ys) = self.model.forward_ca(text_token, codes, ca_src)?;
+                let (logits, ys) =
+                    self.model.forward_ca(text_token, codes, ca_src, None, &().into())?;
                 (logits.i((0, 0))?, ys)
             }
         };

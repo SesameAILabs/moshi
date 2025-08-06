@@ -5,6 +5,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import inspect
 import random
 import os
 from pathlib import Path
@@ -12,7 +13,6 @@ import tarfile
 import time
 import secrets
 import sys
-
 import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
@@ -20,8 +20,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-
-
 from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
@@ -70,6 +68,7 @@ class ServerState:
                 if tokens is None:
                     continue
                 _ = self.mimi.decode(tokens[:, 1:])
+
         torch.cuda.synchronize()
 
     async def handle_chat(self, request):
@@ -189,8 +188,12 @@ def main():
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
                         help="HF repo to look into, defaults Moshiko. "
                              "Use this to select a different pre-trained model.")
+    parser.add_argument("--lora-weight", type=str, help="Path to a local checkpoint file for LoRA.", default=None)
+    parser.add_argument("--config-path", type=str, help="Path to a local config file.", default=None)
     parser.add_argument("--cfg-coef", type=float, default=1., help="CFG coefficient.")
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
+    parser.add_argument("--no_fuse_lora", action="store_false", dest="fuse_lora", default=True,
+                        help="Do not fuse LoRA layers intot Linear layers.")
     parser.add_argument("--half", action="store_const", const=torch.float16, default=torch.bfloat16,
                         dest="dtype", help="Run inference with float16, not bfloat16, better for old GPUs.")
     parser.add_argument(
@@ -222,7 +225,8 @@ def main():
 
     log("info", "retrieving checkpoint")
     checkpoint_info = loaders.CheckpointInfo.from_hf_repo(
-        args.hf_repo, args.moshi_weight, args.mimi_weight, args.tokenizer)
+        args.hf_repo, args.moshi_weight, args.mimi_weight, args.tokenizer,
+        lora_weights=args.lora_weight, config_path=args.config_path)
     log("info", "loading mimi")
     mimi = checkpoint_info.get_mimi(device=args.device)
     log("info", "mimi loaded")
@@ -230,7 +234,7 @@ def main():
     text_tokenizer = checkpoint_info.get_text_tokenizer()
 
     log("info", "loading moshi")
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype)
+    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora)
     log("info", "moshi loaded")
 
     state = ServerState(checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,
@@ -274,10 +278,13 @@ def main():
 
     log("info", f"Access the Web UI directly at {protocol}://{args.host}:{args.port}")
     if setup_tunnel is not None:
-        tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
+        tunnel_kwargs = {}
+        if "share_server_tls_certificate" in inspect.signature(setup_tunnel).parameters:
+            tunnel_kwargs["share_server_tls_certificate"] = None
+        tunnel = setup_tunnel('localhost', args.port, tunnel_token, None, **tunnel_kwargs)
         log("info", f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
         log("info", "Note that this tunnel goes through the US and you might experience high latency in Europe.")
-    web.run_app(app, port=args.port, ssl_context=ssl_context)
+    web.run_app(app, host=args.host , port=args.port, ssl_context=ssl_context)
 
 
 with torch.no_grad():

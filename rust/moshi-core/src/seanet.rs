@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use crate::streaming::{self, StreamTensor, StreamingModule};
+use crate::streaming::{self, StreamMask, StreamTensor, StreamingModule};
 use candle::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -99,6 +99,17 @@ impl SeaNetResnetBlock {
             span: tracing::span!(tracing::Level::TRACE, "sea-resnet"),
         })
     }
+
+    pub fn reset_batch_idx(&mut self, batch_idx: usize, batch_size: usize) -> Result<()> {
+        for b in self.block.iter_mut() {
+            b.reset_batch_idx(batch_idx, batch_size)?;
+        }
+        if let Some(shortcut) = self.shortcut.as_mut() {
+            shortcut.reset_batch_idx(batch_idx, batch_size)?;
+        }
+        self.skip_op.reset_batch_idx(batch_idx, batch_size)?;
+        Ok(())
+    }
 }
 
 impl Module for SeaNetResnetBlock {
@@ -126,15 +137,15 @@ impl StreamingModule for SeaNetResnetBlock {
         }
     }
 
-    fn step(&mut self, xs: &StreamTensor) -> Result<StreamTensor> {
+    fn step(&mut self, xs: &StreamTensor, m: &StreamMask) -> Result<StreamTensor> {
         let _enter = self.span.enter();
         let mut ys = xs.clone();
         for block in self.block.iter_mut() {
-            ys = block.step(&ys.apply(&self.activation)?)?;
+            ys = block.step(&ys.apply(&self.activation)?, m)?;
         }
         match self.shortcut.as_mut() {
-            None => self.skip_op.step(&ys, xs),
-            Some(shortcut) => self.skip_op.step(&ys, &shortcut.step(xs)?),
+            None => self.skip_op.step(&ys, xs, m),
+            Some(shortcut) => self.skip_op.step(&ys, &shortcut.step(xs, m)?, m),
         }
     }
 }
@@ -240,6 +251,18 @@ impl SeaNetEncoder {
             span: tracing::span!(tracing::Level::TRACE, "sea-encoder"),
         })
     }
+
+    pub fn reset_batch_idx(&mut self, batch_idx: usize, batch_size: usize) -> Result<()> {
+        self.init_conv1d.reset_batch_idx(batch_idx, batch_size)?;
+        self.final_conv1d.reset_batch_idx(batch_idx, batch_size)?;
+        for layer in self.layers.iter_mut() {
+            layer.downsample.reset_batch_idx(batch_idx, batch_size)?;
+            for l in layer.residuals.iter_mut() {
+                l.reset_batch_idx(batch_idx, batch_size)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Module for SeaNetEncoder {
@@ -266,16 +289,16 @@ impl StreamingModule for SeaNetEncoder {
         self.final_conv1d.reset_state();
     }
 
-    fn step(&mut self, xs: &StreamTensor) -> Result<StreamTensor> {
+    fn step(&mut self, xs: &StreamTensor, m: &StreamMask) -> Result<StreamTensor> {
         let _enter = self.span.enter();
-        let mut xs = self.init_conv1d.step(xs)?;
+        let mut xs = self.init_conv1d.step(xs, m)?;
         for layer in self.layers.iter_mut() {
             for residual in layer.residuals.iter_mut() {
-                xs = residual.step(&xs)?;
+                xs = residual.step(&xs, m)?;
             }
-            xs = layer.downsample.step(&xs.apply(&self.activation)?)?;
+            xs = layer.downsample.step(&xs.apply(&self.activation)?, m)?;
         }
-        self.final_conv1d.step(&xs.apply(&self.activation)?)
+        self.final_conv1d.step(&xs.apply(&self.activation)?, m)
     }
 }
 
@@ -383,6 +406,18 @@ impl SeaNetDecoder {
             span: tracing::span!(tracing::Level::TRACE, "sea-decoder"),
         })
     }
+
+    pub fn reset_batch_idx(&mut self, batch_idx: usize, batch_size: usize) -> Result<()> {
+        self.init_conv1d.reset_batch_idx(batch_idx, batch_size)?;
+        self.final_conv1d.reset_batch_idx(batch_idx, batch_size)?;
+        for layer in self.layers.iter_mut() {
+            layer.upsample.reset_batch_idx(batch_idx, batch_size)?;
+            for l in layer.residuals.iter_mut() {
+                l.reset_batch_idx(batch_idx, batch_size)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Module for SeaNetDecoder {
@@ -414,16 +449,16 @@ impl StreamingModule for SeaNetDecoder {
         self.final_conv1d.reset_state();
     }
 
-    fn step(&mut self, xs: &StreamTensor) -> Result<StreamTensor> {
+    fn step(&mut self, xs: &StreamTensor, m: &StreamMask) -> Result<StreamTensor> {
         let _enter = self.span.enter();
-        let mut xs = self.init_conv1d.step(xs)?;
+        let mut xs = self.init_conv1d.step(xs, m)?;
         for layer in self.layers.iter_mut() {
-            xs = layer.upsample.step(&xs.apply(&self.activation)?)?;
+            xs = layer.upsample.step(&xs.apply(&self.activation)?, m)?;
             for residual in layer.residuals.iter_mut() {
-                xs = residual.step(&xs)?;
+                xs = residual.step(&xs, m)?;
             }
         }
-        let xs = self.final_conv1d.step(&xs.apply(&self.activation)?)?;
+        let xs = self.final_conv1d.step(&xs.apply(&self.activation)?, m)?;
         let xs = match self.final_activation.as_ref() {
             None => xs,
             Some(act) => xs.apply(act)?,

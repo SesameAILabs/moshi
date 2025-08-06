@@ -253,7 +253,7 @@ impl MsgSender {
 
     async fn send_text(&mut self, text: String) -> Result<()> {
         let msg: Vec<u8> = [&[MsgType::Text.to_u8()], text.as_bytes()].concat();
-        let msg = ws::Message::Binary(msg);
+        let msg = ws::Message::Binary(msg.into());
         self.sender.send(msg).await?;
         Ok(())
     }
@@ -263,7 +263,7 @@ impl MsgSender {
         // 1. Protocol version (`u32`) - always 0 for now.
         // 2. Model version (`u32`).
         let msg: Vec<u8> = [&[MsgType::Handshake.to_u8()], [0u8; 8].as_slice()].concat();
-        let msg = ws::Message::Binary(msg);
+        let msg = ws::Message::Binary(msg.into());
         self.sender.send(msg).await?;
         Ok(())
     }
@@ -271,7 +271,7 @@ impl MsgSender {
     async fn send_metadata(&mut self, md: Box<MetaData>) -> Result<()> {
         let bytes = serde_json::to_vec(&md)?;
         let msg: Vec<u8> = [&[MsgType::Metadata.to_u8()], bytes.as_slice()].concat();
-        let msg = ws::Message::Binary(msg);
+        let msg = ws::Message::Binary(msg.into());
         self.sender.send(msg).await?;
         Ok(())
     }
@@ -304,7 +304,7 @@ impl MsgSender {
             let data = self.pw.inner_mut();
             if !data.is_empty() {
                 let msg: Vec<u8> = [&[MsgType::Audio.to_u8()], data.as_slice()].concat();
-                let msg = ws::Message::Binary(msg);
+                let msg = ws::Message::Binary(msg.into());
                 self.sender.send(msg).await?;
                 self.sender.flush().await?;
                 data.clear();
@@ -352,7 +352,7 @@ impl StreamingModel {
             let pcm_len = in_pcm.len();
             sender.send(StreamOut::InputPcm { pcm_len })?;
             let pcms = candle::Tensor::from_vec(in_pcm, (1, 1, pcm_len), mimi_device)?;
-            let audio_tokens = mimi.encode_step(&pcms.into())?;
+            let audio_tokens = mimi.encode_step(&pcms.into(), &().into())?;
             let audio_tokens = match audio_tokens.as_option() {
                 None => continue,
                 Some(audio_tokens) => audio_tokens,
@@ -408,7 +408,7 @@ impl StreamingModel {
             let pcm_len = in_pcm.len();
             sender.send(StreamOut::InputPcm { pcm_len })?;
             let pcms = candle::Tensor::from_vec(in_pcm, (1, 1, pcm_len), mimi_device)?;
-            let audio_tokens = mimi.encode_step(&pcms.into())?;
+            let audio_tokens = mimi.encode_step(&pcms.into(), &().into())?;
             let audio_tokens = match audio_tokens.as_option() {
                 None => continue,
                 Some(audio_tokens) => audio_tokens,
@@ -426,7 +426,7 @@ impl StreamingModel {
                         candle::Tensor::from_slice(&audio_tokens[..cb], (1, cb, 1), mimi_device)?
                     };
                     tensor_tokens.push(audio_tokens.clone());
-                    let pcm = mimi.decode_step(&audio_tokens.into())?;
+                    let pcm = mimi.decode_step(&audio_tokens.into(), &().into())?;
                     if let Some(pcm) = pcm.as_option() {
                         let pcm = pcm.i((0, 0))?.to_vec1::<f32>()?;
                         sender.send(StreamOut::Pcm { pcm })?;
@@ -478,7 +478,7 @@ impl StreamingModel {
                             (1, 1, pcm_len),
                             &candle::Device::Cpu,
                         )?;
-                        let audio_tokens = mimi.encode_step(&pcms.into())?;
+                        let audio_tokens = mimi.encode_step(&pcms.into(), &().into())?;
                         let audio_tokens = match audio_tokens.as_option() {
                             None => continue,
                             Some(audio_tokens) => audio_tokens,
@@ -507,7 +507,7 @@ impl StreamingModel {
                             )?
                         };
                         tensor_tokens.push(audio_tokens.clone());
-                        let pcm = mimi.decode_step(&audio_tokens.into())?;
+                        let pcm = mimi.decode_step(&audio_tokens.into(), &().into())?;
                         if let Some(pcm) = pcm.as_option() {
                             let pcm = pcm.i((0, 0))?.to_vec1::<f32>()?;
                             sender.send(StreamOut::Pcm { pcm })?;

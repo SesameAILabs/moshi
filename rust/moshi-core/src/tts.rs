@@ -92,6 +92,7 @@ impl Model {
 }
 
 pub fn add_sin_embeddings(xs: &Tensor) -> Result<Tensor> {
+    let target_dtype = xs.dtype();
     let (_b_size, seq_len, dim) = xs.dims3()?;
     let dev = xs.device();
     let half_dim = dim / 2;
@@ -102,9 +103,9 @@ pub fn add_sin_embeddings(xs: &Tensor) -> Result<Tensor> {
     let inv_freq_len = inv_freq.len();
     let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
     let freqs = positions.broadcast_mul(&inv_freq)?;
-    let pos_emb = Tensor::cat(&[freqs.cos()?, freqs.sin()?], D::Minus1)?.to_dtype(xs.dtype())?;
-    let xs = xs.broadcast_add(&pos_emb)?;
-    Ok(xs)
+    let pos_emb = Tensor::cat(&[freqs.cos()?, freqs.sin()?], D::Minus1)?;
+    let xs = xs.to_dtype(DType::F32)?.broadcast_add(&pos_emb)?;
+    xs.to_dtype(target_dtype)
 }
 
 impl Model {
@@ -183,8 +184,13 @@ impl Model {
                 let t = Tensor::new(&[t], conditions.device())?.unsqueeze(0)?;
                 codes.push(Some(t))
             }
-            let (_text_logits, ys) =
-                self.lm.forward_ca(None, codes, &CaSrc::Tokens(conditions.clone()))?;
+            let (_text_logits, ys) = self.lm.forward_ca(
+                None,
+                codes,
+                &CaSrc::Tokens(conditions.clone()),
+                None,
+                &().into(),
+            )?;
             let last_audio_tokens = if self.speaker_cond.is_some() {
                 self.lm.depformer_sample_cfg(
                     &ys,

@@ -4,8 +4,9 @@
 
 use crate::nn::{linear, MaybeQuantizedEmbedding, MaybeQuantizedLinear, MaybeQuantizedVarBuilder};
 use crate::{
+    batched_transformer,
     transformer::{self, CaSrc},
-    NormType,
+    NormType, StreamMask,
 };
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 
@@ -27,6 +28,12 @@ pub struct DepFormerConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExtraHeadsConfig {
+    pub num_heads: usize,
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     pub transformer: transformer::Config,
     pub depformer: Option<DepFormerConfig>,
@@ -35,6 +42,7 @@ pub struct Config {
     pub audio_vocab_size: usize,
     pub audio_codebooks: usize,
     pub conditioners: Option<crate::conditioner::Config>,
+    pub extra_heads: Option<ExtraHeadsConfig>,
 }
 
 impl Config {
@@ -61,6 +69,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         DepFormerConfig { num_slices, transformer: depformer_cfg, low_rank_embeddings: None }
     }
@@ -92,6 +101,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -101,6 +111,7 @@ impl Config {
             text_out_vocab_size: 32000,
             audio_codebooks: 8,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -131,6 +142,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: true,
         };
         Self {
             transformer: lm_cfg,
@@ -140,6 +152,7 @@ impl Config {
             text_out_vocab_size: 32000,
             audio_codebooks: 8,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -201,6 +214,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -210,6 +224,7 @@ impl Config {
             text_out_vocab_size: 32001,
             audio_codebooks: 16,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -238,6 +253,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -247,6 +263,7 @@ impl Config {
             text_out_vocab_size: 48000,
             audio_codebooks: 16,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -284,6 +301,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -293,6 +311,7 @@ impl Config {
             text_out_vocab_size: 48000,
             audio_codebooks: 8,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -319,6 +338,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -328,6 +348,7 @@ impl Config {
             text_out_vocab_size: 48000,
             audio_codebooks: 32,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -359,6 +380,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -368,6 +390,7 @@ impl Config {
             text_out_vocab_size: 8000,
             audio_codebooks: 32,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 
@@ -395,6 +418,7 @@ impl Config {
             conv_kernel_size: 3,
             kv_repeat: 1,
             max_seq_len: 4096,
+            shared_cross_attn: false,
         };
         Self {
             transformer: lm_cfg,
@@ -404,6 +428,7 @@ impl Config {
             text_out_vocab_size: 48000,
             audio_codebooks: 32,
             conditioners: Default::default(),
+            extra_heads: None,
         }
     }
 }
@@ -448,6 +473,8 @@ impl Module for LowRankEmbeddings {
 
 #[derive(Debug, Clone)]
 struct DepFormerSlice {
+    // There is no need for a streaming+batching mode here as the depformer does not have
+    // "persistent" caches.
     transformer: transformer::StreamingTransformer,
     // Note that the embedding for the first slice does not have the same dimension as the
     // embedding for the other slices as it takes a text token as input rather than an audio token.
@@ -589,6 +616,9 @@ impl DepFormer {
                 b_size => candle::bail!("unexpected batch size {b_size}"),
             };
             let token = lp.sample(&logits)?;
+            if VERBOSE.with(|v| *v) {
+                println!("sampled {token} logits {slice_idx}:\n{logits}");
+            }
             tokens.push(token);
             let token_for_next_layer =
                 forced_audio_tokens.get(slice_idx).copied().flatten().unwrap_or(token);
@@ -599,8 +629,69 @@ impl DepFormer {
 }
 
 #[derive(Debug, Clone)]
+enum StreamingTransformer {
+    Normal(transformer::StreamingTransformer),
+    Batched(batched_transformer::StreamingTransformer),
+}
+
+impl crate::StreamingModule for StreamingTransformer {
+    fn reset_state(&mut self) {
+        match self {
+            StreamingTransformer::Normal(t) => t.reset_state(),
+            StreamingTransformer::Batched(t) => t.reset_state(),
+        }
+    }
+
+    fn step(
+        &mut self,
+        xs: &crate::StreamTensor,
+        mask: &crate::StreamMask,
+    ) -> Result<crate::StreamTensor> {
+        match self {
+            StreamingTransformer::Normal(t) => t.step(xs, mask),
+            StreamingTransformer::Batched(t) => t.step(xs, mask),
+        }
+    }
+}
+
+impl StreamingTransformer {
+    fn reset_batch_idx(&mut self, batch_idx: usize, batch_size: usize) -> Result<()> {
+        match self {
+            StreamingTransformer::Normal(t) => t.reset_batch_idx(batch_idx, batch_size),
+            StreamingTransformer::Batched(t) => t.reset_batch_idx(batch_idx),
+        }
+    }
+
+    fn maybe_precompute_ca_kv(&self, ca_src: Option<CaSrc>) -> Result<Option<CaSrc>> {
+        match self {
+            StreamingTransformer::Normal(t) => t.maybe_precompute_ca_kv(ca_src),
+            StreamingTransformer::Batched(t) => t.maybe_precompute_ca_kv(ca_src),
+        }
+    }
+
+    fn forward(&mut self, xs: &Tensor, m: &StreamMask) -> Result<Tensor> {
+        match self {
+            StreamingTransformer::Normal(t) => t.forward(xs),
+            StreamingTransformer::Batched(t) => t.forward(xs, m),
+        }
+    }
+
+    fn forward_ca(
+        &mut self,
+        xs: &Tensor,
+        ca_src: Option<&CaSrc>,
+        m: &StreamMask,
+    ) -> Result<Tensor> {
+        match self {
+            StreamingTransformer::Normal(t) => t.forward_ca(xs, ca_src),
+            StreamingTransformer::Batched(t) => t.forward_ca(xs, ca_src, m),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LmModel {
-    transformer: transformer::StreamingTransformer,
+    transformer: StreamingTransformer,
     text_emb: MaybeQuantizedEmbedding,
     audio_embs: Vec<MaybeQuantizedEmbedding>,
     text_linear: MaybeQuantizedLinear,
@@ -609,11 +700,24 @@ pub struct LmModel {
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
     condition_provider: Option<crate::conditioner::ConditionProvider>,
+    extra_heads: Vec<MaybeQuantizedLinear>,
     dtype: DType,
 }
 
 impl LmModel {
     pub fn new(cfg: &Config, vb: MaybeQuantizedVarBuilder) -> Result<Self> {
+        Self::new_(None, cfg, vb)
+    }
+
+    pub fn batched(batch_size: usize, cfg: &Config, vb: MaybeQuantizedVarBuilder) -> Result<Self> {
+        Self::new_(Some(batch_size), cfg, vb)
+    }
+
+    pub fn new_(
+        batch_size: Option<usize>,
+        cfg: &Config,
+        vb: MaybeQuantizedVarBuilder,
+    ) -> Result<Self> {
         let d_model = cfg.transformer.d_model;
         let depformer = match &cfg.depformer {
             None => None,
@@ -632,8 +736,21 @@ impl LmModel {
             MaybeQuantizedEmbedding::new(cfg.text_in_vocab_size, d_model, vb.pp("text_emb"))?;
         let out_norm = transformer::Norm::new(d_model, &cfg.transformer, vb.pp("out_norm"))?;
         let text_linear = linear(d_model, cfg.text_out_vocab_size, false, vb.pp("text_linear"))?;
-        let transformer =
-            transformer::StreamingTransformer::new(&cfg.transformer, vb.pp("transformer"))?;
+        let transformer = match batch_size {
+            None => {
+                let transformer =
+                    transformer::StreamingTransformer::new(&cfg.transformer, vb.pp("transformer"))?;
+                StreamingTransformer::Normal(transformer)
+            }
+            Some(batch_size) => {
+                let transformer = batched_transformer::StreamingTransformer::new(
+                    batch_size,
+                    &cfg.transformer,
+                    vb.pp("transformer"),
+                )?;
+                StreamingTransformer::Batched(transformer)
+            }
+        };
         let vb_e = vb.pp("emb");
         let mut audio_embs = Vec::with_capacity(cfg.audio_codebooks);
         for i in 0..cfg.audio_codebooks {
@@ -652,6 +769,13 @@ impl LmModel {
                 Some(conditioners)
             }
         };
+        let mut extra_heads = vec![];
+        if let Some(ExtraHeadsConfig { num_heads, dim }) = cfg.extra_heads {
+            for i in 0..num_heads {
+                let extra_head = linear(d_model, dim, false, vb.pp("extra_heads").pp(i))?;
+                extra_heads.push(extra_head)
+            }
+        }
         Ok(Self {
             transformer,
             text_emb,
@@ -662,6 +786,7 @@ impl LmModel {
             text_in_vocab_size: cfg.text_in_vocab_size,
             audio_vocab_size: cfg.audio_vocab_size,
             condition_provider,
+            extra_heads,
             dtype,
         })
     }
@@ -702,12 +827,26 @@ impl LmModel {
         self.text_emb.embeddings().device()
     }
 
+    pub fn dtype(&self) -> DType {
+        self.text_emb.embeddings().dtype()
+    }
+
     pub fn forward(
         &mut self,
         text_ids: Option<Tensor>,
         audio_ids: Vec<Option<Tensor>>,
+        mask: &StreamMask,
     ) -> candle::Result<(Tensor, Tensor)> {
-        self.forward_cond(text_ids, audio_ids, None)
+        self.forward_cond(text_ids, audio_ids, None, mask)
+    }
+
+    pub fn extra_heads(&self, vs: &Tensor) -> Result<Vec<Tensor>> {
+        let mut extra_heads = Vec::with_capacity(self.extra_heads.len());
+        for extra_head in self.extra_heads.iter() {
+            let extra_head = vs.apply(extra_head)?;
+            extra_heads.push(extra_head)
+        }
+        Ok(extra_heads)
     }
 
     pub fn forward_cond(
@@ -715,6 +854,7 @@ impl LmModel {
         text_ids: Option<Tensor>,
         audio_ids: Vec<Option<Tensor>>,
         conditions: Option<&crate::conditioner::Condition>,
+        mask: &StreamMask,
     ) -> candle::Result<(Tensor, Tensor)> {
         if VERBOSE.with(|v| *v) {
             print!("text_ids ");
@@ -754,7 +894,7 @@ impl LmModel {
                 crate::conditioner::Condition::AddToInput(v) => emb = emb.broadcast_add(v)?,
             }
         }
-        let ys = self.transformer.forward(&emb)?;
+        let ys = self.transformer.forward(&emb, mask)?;
         let ys = ys.apply(&self.out_norm)?;
         let logits = ys.apply(&self.text_linear)?;
         if VERBOSE.with(|v| *v) {
@@ -776,7 +916,28 @@ impl LmModel {
         text_ids: Option<Tensor>,
         audio_ids: Vec<Option<Tensor>>,
         ca_src: &CaSrc,
+        conditions: Option<&crate::conditioner::Condition>,
+        mask: &StreamMask,
     ) -> candle::Result<(Tensor, Tensor)> {
+        if VERBOSE.with(|v| *v) {
+            print!("text_ids ");
+            if let Some(text_ids) = text_ids.as_ref() {
+                let text_ids = text_ids.flatten_all()?.to_vec1::<u32>()?;
+                println!("{text_ids:?}");
+            } else {
+                println!("none")
+            }
+            print!("audio_ids ");
+            for audio_id in audio_ids.iter() {
+                if let Some(audio_id) = audio_id {
+                    let audio_id = audio_id.flatten_all()?.to_vec1::<u32>()?;
+                    print!(" {audio_id:?}");
+                } else {
+                    print!(" none")
+                }
+            }
+            println!();
+        }
         let b_size = match ca_src {
             CaSrc::KeysValues((cak, _)) => cak.dim(0)?,
             CaSrc::Tokens(catoks) => catoks.dim(0)?,
@@ -794,7 +955,12 @@ impl LmModel {
                 emb = emb.broadcast_add(&e)?
             }
         }
-        let ys = self.transformer.forward_ca(&emb, Some(ca_src))?;
+        if let Some(conditions) = conditions {
+            match conditions {
+                crate::conditioner::Condition::AddToInput(v) => emb = emb.broadcast_add(v)?,
+            }
+        }
+        let ys = self.transformer.forward_ca(&emb, Some(ca_src), mask)?;
         let ys = ys.apply(&self.out_norm)?;
         let logits = ys.apply(&self.text_linear)?;
         Ok((logits, ys))
@@ -833,6 +999,10 @@ impl LmModel {
             }
         };
         Ok(sample)
+    }
+
+    pub fn reset_batch_idx(&mut self, batch_idx: usize, batch_size: usize) -> Result<()> {
+        self.transformer.reset_batch_idx(batch_idx, batch_size)
     }
 }
 
